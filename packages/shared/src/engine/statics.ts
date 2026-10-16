@@ -807,8 +807,10 @@ export function disabledByEffect(state: GameState, unit: UnitState): boolean {
   if (ix && ix.gen === state.nextId) {
     for (const oid of ix.u) {
       const o = state.units[oid]
-      if (!o || o.id === unit.id || o.silenced || disabledByEffect(state, o)) continue
-      if (disablesNow(o.name, o.id)) return true
+      if (!o || o.id === unit.id || o.silenced) continue
+      // would it disable this unit at all? only then does its OWN disabled state matter (that check
+      // recurses, and recursing for every unit at every level is exponential in the board size)
+      if (disablesNow(o.name, o.id) && !disabledByEffect(state, o)) return true
     }
     for (const aid of ix.a) {
       const art = state.artifacts[aid]
@@ -822,8 +824,8 @@ export function disabledByEffect(state: GameState, unit: UnitState): boolean {
     if (ix.area && brookHits()) return true
   } else {
     for (const o of Object.values(state.units)) {
-      if (o.id === unit.id || o.silenced || disabledByEffect(state, o)) continue
-      if (disablesNow(o.name, o.id)) return true
+      if (o.id === unit.id || o.silenced) continue
+      if (disablesNow(o.name, o.id) && !disabledByEffect(state, o)) return true
     }
     for (const a of Object.values(state.artifacts)) {
       if (!a.carriedBy && disablesNow(a.name, a.id)) return true
