@@ -69,7 +69,7 @@ describe('Waveshaper FAQ', () => {
     expect(g.sites[target.id].flooded).toBe(true)
   })
 
-  it('FAQ3: a different flooded site (not kept by this Waveshaper) stays out of candidates', () => {
+  it('a site flooded by other means (not kept by this Waveshaper) is a candidate too', () => {
     const g: any = newGame(); keepBoth(g)
     const water = placeSite(g, 0, 'Pond', 2, 1)
     const target = placeSite(g, 0, 'Hamlet', 2, 2)
@@ -82,7 +82,8 @@ describe('Waveshaper FAQ', () => {
     ;(ctx as any).ask = (prompt: any) => { squares = prompt.data?.squares ?? [] }
     getScript('Waveshaper')!.abilities![0].effect(ctx)
 
-    // A site flooded by another means should NOT appear (it's already flooded by something else)
-    expect(squares.some((sq: any) => sq.x === target.x && sq.y === target.y)).toBe(false)
+    // Nothing in the card or its FAQ asks for a DRY site: the wave still crashes over it and taps
+    // the minions there (an enemy on an Atlantean Fate site), so it is offered like any other
+    expect(squares.some((sq: any) => sq.x === target.x && sq.y === target.y)).toBe(true)
   })
 })

@@ -18,14 +18,13 @@ registerScript('Waveshaper', {
       const squares: { x: number; y: number }[] = []
       for (const w of water) {
         for (const adj of nearbySquaresW(ctx.state, w.x, w.y)) {
-          const s = siteAt(ctx.state, adj.x, adj.y)
-          // FAQ3: same site may be re-selected (keep it flooded continuously).
-          // Allow already-flooded sites that this Waveshaper is currently keeping flooded.
-          const keptByThis = ctx.state.flow?.waveshaperFlood?.[ctx.controller] === (s?.id)
-          if (s && (!s.flooded || keptByThis) && !squares.some((q) => q.x === adj.x && q.y === adj.y)) squares.push(adj)
+          // ANY site near your waters — an already-flooded one too (FAQ3: the same site may be
+          // re-selected; and a site some other effect flooded, e.g. Atlantean Fate, still gets its
+          // minions tapped down: nothing in the text asks for a dry site).
+          if (siteAt(ctx.state, adj.x, adj.y) && !squares.some((q) => q.x === adj.x && q.y === adj.y)) squares.push(adj)
         }
       }
-      if (!squares.length) return ctx.log('No dry site near your waters.')
+      if (!squares.length) return ctx.log('No site near your waters.')
       ctx.ask({ kind: 'chooseSquare', title: 'The wave crashes over which site?', data: { squares } }, 'wave')
     },
   }],
@@ -35,10 +34,19 @@ registerScript('Waveshaper', {
       if (!site) return
       const prev = ctx.state.flow?.waveshaperFlood?.[ctx.controller]
       ctx.state.flow = ctx.state.flow ?? {}
+      // a site already flooded by a PERMANENT effect (Atlantean Fate sets `flooded` once; siteStillFlooded
+      // can't re-derive it) must stay flooded when the wave later moves on — remember it
+      const ownFloods: string[] = ctx.state.flow.floodedBeforeWave ?? []
+      if (site.flooded && !siteStillFlooded(ctx.state, site.id) && !ownFloods.includes(site.id)) ownFloods.push(site.id)
+      ctx.state.flow.floodedBeforeWave = ownFloods
       // move this Waveshaper's standing wave to the new site FIRST, then re-derive the old site's flood so
       // it stays wet if some OTHER source (a Naiads, another Waveshaper, a Floodplain flood) still floods it
       ctx.state.flow.waveshaperFlood = { ...(ctx.state.flow.waveshaperFlood ?? {}), [ctx.controller]: site.id }
-      if (prev && ctx.state.sites[prev]) ctx.state.sites[prev].flooded = siteStillFlooded(ctx.state, prev)
+      if (prev && ctx.state.sites[prev]) {
+        const keep = prev !== site.id && ownFloods.includes(prev)
+        ctx.state.sites[prev].flooded = keep || siteStillFlooded(ctx.state, prev)
+        if (keep) ctx.state.flow.floodedBeforeWave = ownFloods.filter((id) => id !== prev)
+      }
       ctx.floodSite(site.id)
       for (const u of unitsAt(ctx.state, site.x, site.y, 'surface')) {
         const kw = getKeywords(u.name)
