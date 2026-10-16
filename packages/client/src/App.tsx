@@ -30,6 +30,7 @@ import SealedDeckbuild from './components/SealedDeckbuild'
 import Game from './components/Game'
 import ReplayViewer from './components/ReplayViewer'
 import ReplaysPage from './components/ReplaysPage'
+import BugsAdminPage from './components/BugsAdminPage'
 import { startReplay, type ReplayRecord } from './replay'
 import { loadCollection, ownedCopies, ripEriksCuriosa, syncCollectionOnSignIn, clearCollectionOnLogout, keepSealedPool } from './collection'
 import { markUnlocked, syncAchievementsOnSignIn, clearAchievementsOnLogout } from './achievements'
@@ -52,6 +53,8 @@ export interface Session {
   sendChat?: (msg: string) => void
   /** local games (hotseat / vs-computer): save a replay of the game to your account */
   onSaveReplay?: (name: string, isPublic: boolean) => Promise<void>
+  /** report a bug mid-game: captures the replay-so-far + a scenario snapshot (online = server-side) */
+  onReportBug?: (msg: string) => Promise<void> | void
   /** online creator, before an opponent joins: change your deck and/or the room clock */
   updateRoom?: (deck: DeckList, clock: ClockConfig | null) => void
   /** online: has the opponent granted this seat editor access? (always true offline) */
@@ -115,11 +118,12 @@ function clearRoomUrl(): void {
 
 /** playing a CARD (a spell/minion/aura/artifact cast, or a site play) — the only
  *  actions that arm the "↩ Go back" free-undo on their first prompt. */
+// activated abilities that are held TENTATIVELY (tentativePlay) and may be backed out of freely until
+// they commit — their prompts get the same "↩ Go back" free-undo as a card play.
+const TENTATIVE_ACTIVATE_ABILITIES = new Set(['animate', 'zeal'])
 function isCardPlay(a: Action): boolean {
   return a.t === 'castSpell' || (a.t === 'avatarSite' && a.mode === 'play')
-    // Animist "cast a magic as a Spirit" is held tentatively like a play (recorded only if it casts),
-    // so its first prompt gets the same "↩ Go back" free-undo.
-    || (a.t === 'activate' && a.ability === 'animate')
+    || (a.t === 'activate' && TENTATIVE_ACTIVATE_ABILITIES.has(a.ability))
 }
 /** every deck carries a stable id; starters get a deterministic one */
 function ensureDeckId(d: DeckList): DeckList {
@@ -217,8 +221,10 @@ function fmtRestart(ms: number): string {
 }
 
 export default function App() {
-  const [page, setPage] = useState<'home' | 'decks' | 'game' | 'collection' | 'scenarios' | 'replays' | 'replay'>('home')
+  const [page, setPage] = useState<'home' | 'decks' | 'game' | 'collection' | 'scenarios' | 'replays' | 'replay' | 'bugs'>('home')
   const [replayData, setReplayData] = useState<ReplayRecord | null>(null)
+  // where the full-screen replay viewer returns on leave — the replay list, or the admin bugs panel
+  const [replayReturn, setReplayReturn] = useState<'replays' | 'bugs'>('replays')
   const [session, setSession] = useState<Session | null>(null)
   const [username, setUsername] = useState<string | null>(auth.getUsername())
   const [error, setError] = useState<string | null>(null)
@@ -250,6 +256,9 @@ export default function App() {
   // true while a just-played card's FIRST prompt is open → its "↩ Go back" free undo
   // is available (armed on a card play, disarmed on any answer/other action).
   const [playPending, setPlayPending] = useState(false)
+  // true while we're inside a TENTATIVE-ACTIVATE flow (Animist, Persecutor): the "↩ Go back" stays
+  // available across ALL its prompts (not just the first), since nothing commits until the end.
+  const tentFlowRef = useRef(false)
   const localHistory = useRef<string[]>([])
   // chess clock (local modes only — online is server-authoritative): last wall-clock
   // ms we charged the running seat; `clockNow` just drives a 4Hz display re-render.
@@ -486,13 +495,35 @@ export default function App() {
 
   // arm/disarm the "↩ Go back" free undo: a card play arms it (its first prompt can
   // be undone free); answering that prompt — or any other action — disarms it.
-  function armGoBack(action: Action) { setPlayPending(isCardPlay(action)) }
+  function armGoBack(action: Action) {
+    if (isCardPlay(action)) {
+      // a tentative-ACTIVATE flow keeps "↩ Go back" armed across all its prompts; a plain card play
+      // (cast / site) only offers it on the first prompt (disarmed on the first answer).
+      tentFlowRef.current = action.t === 'activate' && TENTATIVE_ACTIVATE_ABILITIES.has(action.ability)
+      setPlayPending(true)
+    } else if (action.t === 'prompt' && tentFlowRef.current) {
+      setPlayPending(true) // still mid tentative-activate flow → keep the go-back
+    } else {
+      tentFlowRef.current = false
+      setPlayPending(false)
+    }
+  }
+  // A tentative-activate flow (Persecutor/Animist) keeps the go-back armed across its prompts; once the
+  // flow ENDS (committed or rolled back → no prompt left to answer), disarm so a later, unrelated prompt
+  // never shows a stale "↩ Go back". (Normal card plays are unaffected — tentFlowRef is false for them.)
+  useEffect(() => {
+    if (!tentFlowRef.current) return
+    const v: any = session?.view ?? session?.local
+    if (v && (!v.prompts || v.prompts.length === 0)) { tentFlowRef.current = false; setPlayPending(false) }
+  }, [session])
+
   /** discard a just-played card while its first prompt is open. Local: restore the
    *  pre-cast snapshot. Online: ask the server to roll back the tentative cast (which
    *  the opponent never saw). */
   function freeGoBack() {
     if (session?.kind === 'online') netRef.current?.cancelCast()
     else localUndo()
+    tentFlowRef.current = false
     setPlayPending(false)
   }
 
@@ -511,6 +542,7 @@ export default function App() {
       noAchv,
       requestUndo: localUndo, // both players share the screen: undo is by consent
       onSaveReplay: saveReplay,
+      onReportBug: reportBugLocal,
       send: (action: Action) => {
         // in hotseat the acting player is whoever the UI says is acting
         armGoBack(action)
@@ -578,6 +610,19 @@ export default function App() {
     await auth.pushReplay({ id, name, isPublic, data: r })
   }
 
+  /** report a bug in a LOCAL game (hotseat / vs-bot / scenario): send the message + the replay-so-far
+   *  + a full scenario snapshot of the current board. The ReplayRecord's own `mode` tags it. */
+  async function reportBugLocal(msg: string): Promise<void> {
+    const state = localRef.current
+    const replay = recordingRef.current
+    await auth.reportBug({
+      message: msg,
+      mode: replay?.mode ?? 'scenario', // scenarios don't record → no replay → tag as 'scenario'
+      replay: replay ?? null,
+      scenario: state ? (JSON.parse(JSON.stringify(state)) as GameState) : null,
+    })
+  }
+
   /** save the just-finished ONLINE game (the server handed us the full record at game-over). */
   async function saveOnlineReplay(name: string, isPublic: boolean): Promise<void> {
     const r = onlineReplayRef.current
@@ -606,6 +651,7 @@ export default function App() {
       botDifficulty: difficulty,
       requestUndo: localUndo, // the computer is a gracious opponent
       onSaveReplay: saveReplay,
+      onReportBug: reportBugLocal,
       send: (action: Action) => {
         armGoBack(action)
         runLocal(0, action)
@@ -734,6 +780,7 @@ export default function App() {
         roomCode: msg.code,
         mode: msg.mode ?? 'standard',
         send: (action: Action) => { armGoBack(action); net.action(action) },
+        onReportBug: (m: string) => net.reportBug(m), // server captures the replay-so-far + scenario
         requestUndo: () => net.send({ t: 'undoRequest' }),
         requestEditor: () => net.send({ t: 'editorRequest' }),
         sendChat: (msg: string) => net.chat(msg),
@@ -1099,6 +1146,8 @@ export default function App() {
           onCollection={() => setPage('collection')}
           onScenarios={() => setPage('scenarios')}
           onWatchReplay={() => setPage('replays')}
+          isAdmin={auth.isAdminUser()}
+          onOpenBugs={() => setPage('bugs')}
           initialRoomCode={pendingJoin}
         />
       )}
@@ -1106,14 +1155,21 @@ export default function App() {
         <ReplaysPage
           username={username}
           onBack={() => setPage('home')}
-          onWatch={(r) => { setReplayData(r); setPage('replay') }}
+          onWatch={(r) => { setReplayReturn('replays'); setReplayData(r); setPage('replay') }}
         />
       )}
       {page === 'replay' && replayData && (
         <ReplayViewer
           replay={replayData}
           mobile={mm.mobile}
-          onLeave={() => { setReplayData(null); setPage('replays') }}
+          onLeave={() => { setReplayData(null); setPage(replayReturn) }}
+        />
+      )}
+      {page === 'bugs' && (
+        <BugsAdminPage
+          onBack={() => setPage('home')}
+          onOpenReplay={(r) => { setReplayReturn('bugs'); setReplayData(r); setPage('replay') }}
+          onOpenScenario={(state) => startScenario(state)}
         />
       )}
       {page === 'decks' && <DeckBuilder onBack={() => setPage('home')} />}
