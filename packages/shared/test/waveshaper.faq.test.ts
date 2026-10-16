@@ -13,8 +13,9 @@ function waveshaperCtx(g: any, player: 0 | 1 = 0) {
 describe('Waveshaper FAQ', () => {
   it('FAQ3: already-flooded site kept by Waveshaper appears in candidate list', () => {
     const g: any = newGame(); keepBoth(g)
-    // Water site at (2,1) acts as the body of water
+    // Water site at (2,1) acts as the body of water — the AVATAR must stand in it ("your body of water")
     const water = placeSite(g, 0, 'Pond', 2, 1)
+    const av = g.units[g.players[0].avatarUnitId]; av.x = 2; av.y = 1
     // A site adjacent to the water site at (2,2)
     const target = placeSite(g, 0, 'Hamlet', 2, 2)
     // Mark this site as already kept-flooded by Waveshaper for player 0
@@ -40,6 +41,7 @@ describe('Waveshaper FAQ', () => {
     const g: any = newGame(); keepBoth(g)
     // Use in-bounds coordinates: grid is 5 wide x 4 tall (y 0-3)
     const water = placeSite(g, 0, 'Pond', 3, 1)
+    const av = g.units[g.players[0].avatarUnitId]; av.x = 3; av.y = 1 // avatar stands in the body of water
     const kept = placeSite(g, 0, 'Hamlet', 3, 2)
     kept.flooded = true
     g.flow = { waveshaperFlood: { 0: kept.id } }
@@ -69,9 +71,10 @@ describe('Waveshaper FAQ', () => {
     expect(g.sites[target.id].flooded).toBe(true)
   })
 
-  it('a site flooded by other means (not kept by this Waveshaper) is a candidate too', () => {
+  it('FAQ3: a site flooded by another source near your waters IS still a target (to tap minions there)', () => {
     const g: any = newGame(); keepBoth(g)
     const water = placeSite(g, 0, 'Pond', 2, 1)
+    const av = g.units[g.players[0].avatarUnitId]; av.x = 2; av.y = 1 // avatar stands in the body of water
     const target = placeSite(g, 0, 'Hamlet', 2, 2)
     // Flooded by some OTHER means, not by this Waveshaper
     target.flooded = true
@@ -82,8 +85,8 @@ describe('Waveshaper FAQ', () => {
     ;(ctx as any).ask = (prompt: any) => { squares = prompt.data?.squares ?? [] }
     getScript('Waveshaper')!.abilities![0].effect(ctx)
 
-    // Nothing in the card or its FAQ asks for a DRY site: the wave still crashes over it and taps
-    // the minions there (an enemy on an Atlantean Fate site), so it is offered like any other
+    // ANY nearby site may be chosen now — even one already flooded by another source — to wash over
+    // (and tap) the non-submerge minions standing on it (per the FAQ).
     expect(squares.some((sq: any) => sq.x === target.x && sq.y === target.y)).toBe(true)
   })
 })
