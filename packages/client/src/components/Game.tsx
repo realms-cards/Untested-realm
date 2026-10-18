@@ -7,6 +7,9 @@ import {
   allCards,
   affordable,
   canCast,
+  canHandArtifactTo,
+  genesisSelfTargetOk,
+  SELF_TARGET,
   cardSupport,
   effAttack,
   effDefence,
@@ -165,7 +168,7 @@ type Mode =
   // Multi-select card menu for picking up / dropping artifacts, opened only when a unit
   // can pick up (or can drop) MORE THAN ONE artifact. Each candidate is listed
   // separately (no de-duping of same-named artifacts); `picked` holds the chosen ids.
-  | { m: 'chooseArts'; kind: 'pickup' | 'drop'; unitId: string; artIds: string[]; picked: string[] }
+  | { m: 'chooseArts'; kind: 'pickup' | 'drop'; unitId: string; artIds: string[]; picked: string[]; unitIds?: string[] }
 
 /** shown while a room creator waits alone: change your deck and/or the clock; the
  *  chosen setup is applied the moment an opponent joins (server-side maybeStart). */
@@ -1694,9 +1697,9 @@ function GameInner({
       )
     }
     if (mode.m === 'conjure') {
-      const enemyOk = !!getScript(view.cards[mode.cardId]?.name ?? '')?.conjureToEnemy
+      const name = view.cards[mode.cardId]?.name ?? ''
       return new Set<string>(
-        (Object.values(view.units) as UnitState[]).filter((u) => enemyOk || u.controller === me).map((u) => u.id),
+        (Object.values(view.units) as UnitState[]).filter((u) => me !== null && canHandArtifactTo(st, me, name, u)).map((u) => u.id),
       )
     }
     // magic / abilityTargets: highlight legal unit/minion/avatar/artifact/site targets
@@ -2623,8 +2626,7 @@ function GameInner({
     // conjuring an artifact: click a unit to HAND it over (carried) instead of
     // placing it on a site — your own unit, or any unit if it conjures to enemies
     if (mode.m === 'conjure') {
-      const enemyOk = !!getScript(view.cards[mode.cardId]?.name ?? '')?.conjureToEnemy
-      if (u.controller === me || enemyOk) {
+      if (me !== null && canHandArtifactTo(st, me, view.cards[mode.cardId]?.name ?? '', u)) {
         send({ t: 'castSpell', cardId: mode.cardId, casterId: mode.casterId, extra: { giveTo: u.id } })
         setMode({ m: 'idle' })
       }
@@ -4693,7 +4695,7 @@ function GameInner({
           setMode({ ...cur, picked: cur.picked.includes(id) ? cur.picked.filter((x) => x !== id) : [...cur.picked, id] })
         return (
           <div className="modal" data-promptbox="chooseArts">
-            <h3>{cur.kind === 'pickup' ? 'Pick up which artifacts?' : 'Drop which artifacts?'}</h3>
+            <h3>{cur.kind === 'drop' ? 'Drop which artifacts?' : cur.unitIds?.length ? 'Pick up what?' : 'Pick up which artifacts?'}</h3>
             <div className="mullhand">
               {cur.artIds.map((id) => {
                 const a: any = (view.artifacts as any)[id]
@@ -4707,16 +4709,30 @@ function GameInner({
                   </div>
                 )
               })}
+              {(cur.unitIds ?? []).map((id) => {
+                const o = view.units[id]
+                if (!o) return null
+                return (
+                  <div key={id} data-artchoice={id}
+                    className={`handcard ${cur.picked.includes(id) ? 'selected' : ''}`}
+                    onMouseEnter={() => showHover(o.name, false, view.cards[o.cardId]?.art)}
+                    onClick={() => toggle(id)}>
+                    <CardImg name={o.name} className="handimg" />
+                  </div>
+                )
+              })}
             </div>
             <button data-confirm="1" disabled={cur.picked.length === 0}
               onClick={() => {
                 if (cur.picked.length === 0) return
+                const units = cur.picked.filter((id) => cur.unitIds?.includes(id))
+                const arts = cur.picked.filter((id) => !cur.unitIds?.includes(id))
                 send(cur.kind === 'pickup'
-                  ? { t: 'pickUp', unitId: cur.unitId, artifactIds: cur.picked }
+                  ? { t: 'pickUp', unitId: cur.unitId, artifactIds: arts, ...(units.length ? { unitIds: units } : {}) }
                   : { t: 'drop', unitId: cur.unitId, artifactIds: cur.picked })
                 setMode(unit ? { m: 'unit', unitId: cur.unitId } : { m: 'idle' })
               }}>
-              {cur.kind === 'pickup' ? 'Pick up' : 'Drop'} ({cur.picked.length}/{cur.artIds.length})
+              {cur.kind === 'pickup' ? 'Pick up' : 'Drop'} ({cur.picked.length}/{cur.artIds.length + (cur.unitIds?.length ?? 0)})
             </button>
             <button data-cancel="1" onClick={() => setMode(unit ? { m: 'unit', unitId: cur.unitId } : { m: 'idle' })}>Cancel</button>
           </div>
@@ -4840,6 +4856,13 @@ function GameInner({
       {mode.m === 'genesisTargets' && (
         <div className="promptbanner" data-modebanner="genesisTargets">
           Choose a target for {view.cards[mode.cardId]?.name}'s Genesis (click a unit) —{' '}
+          {/* the minion doesn't exist yet, so it can't be clicked: offer "itself" when its Genesis may
+              target it (Town Priest under a Corruptor — Evil, and adjacent to its own square) */}
+          {me !== null && genesisSelfTargetOk(st, me, view.cards[mode.cardId]?.name ?? '', mode.at, mode.picked.length, mode.picked.map((id) => ({ unit: id }))) && (
+            <button data-self="1" onClick={() => { send({ t: 'castSpell', cardId: mode.cardId, casterId: mode.casterId, at: mode.at, targets: [...mode.picked, SELF_TARGET] }); setMode({ m: 'idle' }) }}>
+              itself
+            </button>
+          )}{' '}
           <button data-skip="1" onClick={() => { send({ t: 'castSpell', cardId: mode.cardId, casterId: mode.casterId, at: mode.at, targets: [] }); setMode({ m: 'idle' }) }}>
             skip
           </button>
@@ -5697,10 +5720,10 @@ function UnitChip({ u, st, me, small, big, ghost, bodyActive, selected, picked, 
       )}
       {/* Dragonlord's set-aside Unique Dragon — shown small (like a carried artifact) inside
           the avatar card. Only on YOUR own Dragonlord (the pick is hidden from the opponent). */}
-      {u.isAvatar && u.name === 'Dragonlord' && u.controller === me && st.flow?.dragonlordPick?.[me] && (
+      {u.isAvatar && u.name === 'Dragonlord' && st.flow?.dragonlordPick?.[u.controller] && (
         <span className="carriedarts dragonaside">
-          <span className="carriedart" data-dragon-aside={st.flow.dragonlordPick[me]} title={`Set aside: ${st.flow.dragonlordPick[me]}`} onMouseEnter={() => onHover(st.flow.dragonlordPick[me])}>
-            <CardImg name={st.flow.dragonlordPick[me]} className="artthumb" />
+          <span className="carriedart" data-dragon-aside={st.flow.dragonlordPick[u.controller]} title={`Set aside: ${st.flow.dragonlordPick[u.controller]}`} onMouseEnter={() => onHover(st.flow.dragonlordPick[u.controller])}>
+            <CardImg name={st.flow.dragonlordPick[u.controller]} className="artthumb" />
           </span>
         </span>
       )}
@@ -6276,7 +6299,7 @@ function PromptBox({ view, prompt, send, me, flip, onHover, onGoBack, interceptA
             ? 'Click them in the order they should resolve — the first you pick resolves first.'
             : place === 'top'
             ? 'Click them in order — the first you pick is the top of your deck (drawn next).'
-            : 'Click them in order — the last you pick sits at the very bottom of your deck.'}</p>
+            : 'Click them in order, starting from the bottom — the first you pick goes to the very bottom of your deck.'}</p>
           <div className="mullhand">
             {cards.map((name, i) => {
               const pos = sel.indexOf(String(i))
@@ -7120,12 +7143,15 @@ function unitActions(st: any, view: PlayerView, me: PlayerId, mode: Mode, setMod
         const label = vdest.region === 'underground' ? '⛏ Burrow' : vdest.region === 'underwater' ? '🌊 Submerge' : '🏔 Surface'
         return <button data-vmove={vdest.region} data-source={u.id} onClick={() => verticalMove(u, vdest)}>{label}</button>
       })()}
-      {artsHere.length === 1 && (
+      {artsHere.length === 1 && unitsHere.length === 0 && (
         <button data-pickup-arts={u.id} onClick={() => send({ t: 'pickUp', unitId: u.id, artifactIds: [artsHere[0].id] })}>Pick up {artsHere[0].name}</button>
       )}
-      {/* 2+ pickable artifacts here → let the player choose which ones (multi-select) */}
-      {artsHere.length > 1 && (
-        <button data-pickup-arts={u.id} onClick={() => setMode({ m: 'chooseArts', kind: 'pickup', unitId: u.id, artIds: artsHere.map((a: any) => a.id), picked: [] })}>Pick up artifacts…</button>
+      {/* 2+ things it could take here → let the player choose which ones (multi-select). Pick Up is
+          once per turn, but that one Pick Up may take any mix of artifacts AND units it can carry. */}
+      {artsHere.length + unitsHere.length > 1 && (
+        <button data-pickup-arts={u.id} onClick={() => setMode({ m: 'chooseArts', kind: 'pickup', unitId: u.id, artIds: artsHere.map((a: any) => a.id), unitIds: unitsHere.map((o) => o.id), picked: [] })}>
+          {unitsHere.length ? 'Pick up…' : 'Pick up artifacts…'}
+        </button>
       )}
       {unitsHere.map((o) => (
         <button key={o.id} data-carry={o.id} data-source={u.id} onClick={() => send({ t: 'pickUp', unitId: u.id, artifactIds: [], unitIds: [o.id] })}>
