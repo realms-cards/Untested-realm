@@ -3,7 +3,7 @@ import {
   applyAction,
   applyAchievements,
   createGame,
-  starterDecks,
+  featuredDecks,
   viewFor,
   actingSeatFor,
   settleClock,
@@ -18,6 +18,7 @@ import {
   type PlayerId,
   type PlayerView,
   migrateLegacyKeywords,
+  sanitizeCustomArt,
 } from '@sorcery/shared'
 import { Net, type ServerMsg, type SealedStateMsg, type SealedConfig } from './net'
 import { botAction, botNeedsToAct, botActionKey } from './bot'
@@ -32,6 +33,7 @@ import Game from './components/Game'
 import ReplayViewer from './components/ReplayViewer'
 import ReplaysPage from './components/ReplaysPage'
 import BugsAdminPage from './components/BugsAdminPage'
+import TokenArtAdminPage from './components/TokenArtAdminPage'
 import { startReplay, type ReplayRecord } from './replay'
 import { loadCollection, ownedCopies, ripEriksCuriosa, syncCollectionOnSignIn, clearCollectionOnLogout, keepSealedPool } from './collection'
 import { markUnlocked, syncAchievementsOnSignIn, clearAchievementsOnLogout } from './achievements'
@@ -56,6 +58,9 @@ export interface Session {
   onSaveReplay?: (name: string, isPublic: boolean) => Promise<void>
   /** report a bug mid-game: captures the replay-so-far + a scenario snapshot (online = server-side) */
   onReportBug?: (msg: string) => Promise<void> | void
+  /** local games on your own machine: mark this moment for review (with a note) and write the game to
+   *  the match archive now. Resolves to the saved file's name. */
+  onFlagForReview?: (note: string) => Promise<string>
   /** online creator, before an opponent joins: change your deck and/or the room clock */
   updateRoom?: (deck: DeckList, clock: ClockConfig | null) => void
   /** online: has the opponent granted this seat editor access? (always true offline) */
@@ -129,10 +134,10 @@ function isCardPlay(a: Action): boolean {
 /** every deck carries a stable id; starters get a deterministic one */
 function ensureDeckId(d: DeckList): DeckList {
   if (d.id) return d
-  return { ...d, id: starterDecks.some((s) => s.name === d.name) ? `starter:${d.name}` : newDeckId() }
+  return { ...d, id: featuredDecks.some((s) => s.name === d.name) ? `starter:${d.name}` : newDeckId() }
 }
 function isStarter(d: DeckList): boolean {
-  return starterDecks.some((s) => s.name === d.name)
+  return featuredDecks.some((s) => s.name === d.name)
 }
 function localCustomDecks(): DeckList[] {
   try { return (JSON.parse(localStorage.getItem('sorcery-decks') ?? '[]') as DeckList[]) } catch { return [] }
@@ -156,7 +161,7 @@ export function loadDecks(): DeckList[] {
   })
   if (changed) writeCustom(custom)
   const names = new Set(custom.map((d) => d.name))
-  const starters = starterDecks.filter((d) => !names.has(d.name)).map(ensureDeckId)
+  const starters = featuredDecks.filter((d) => !names.has(d.name)).map(ensureDeckId)
   // pickers show YOUR decks first (alphabetical), then the built-in default decks (alphabetical)
   const byName = (a: DeckList, b: DeckList) => a.name.localeCompare(b.name)
   return [...custom.slice().sort(byName), ...starters.slice().sort(byName)]
@@ -203,6 +208,11 @@ export async function syncDecksOnSignIn(): Promise<void> {
 /** a deck built in collection mode fetches from the player's owned pool; wire that
  *  owned pool into the deck's `collection` so in-game fetch effects (Silver Bullet,
  *  Toolbox…) draw from it. Other decks keep whatever collection they define. */
+/** the custom token arts this account may use in a LOCAL game (online, the server decides by account) */
+function grantedArtIds(): Set<string> { return new Set(auth.myTokenArtsCached().map((a) => a.id)) }
+/** a deck for a local game (hotseat / vs Computer): its collection pool, and only arts this account may use */
+function forLocalGame(deck: DeckList): DeckList { return withCollection(sanitizeCustomArt(deck, grantedArtIds())) }
+
 function withCollection(deck: DeckList): DeckList {
   if (!deck.fromCollection) return deck
   const col = loadCollection()
@@ -222,7 +232,7 @@ function fmtRestart(ms: number): string {
 }
 
 export default function App() {
-  const [page, setPage] = useState<'home' | 'decks' | 'game' | 'collection' | 'scenarios' | 'replays' | 'replay' | 'bugs'>('home')
+  const [page, setPage] = useState<'home' | 'decks' | 'game' | 'collection' | 'scenarios' | 'replays' | 'replay' | 'bugs' | 'tokenArt'>('home')
   const [replayData, setReplayData] = useState<ReplayRecord | null>(null)
   // where the full-screen replay viewer returns on leave — the replay list, or the admin bugs panel
   const [replayReturn, setReplayReturn] = useState<'replays' | 'bugs'>('replays')
@@ -328,6 +338,11 @@ export default function App() {
   const localRef = useRef<GameState | null>(null)
   // live replay recording for the current LOCAL game (hotseat / vs-computer); null online or when off
   const recordingRef = useRef<ReplayRecord | null>(null)
+  // local match archive (see archiveLocalGame): moments flagged for review, the bot difficulty, and
+  // whether the finished game has been written yet
+  const reviewFlagsRef = useRef<{ at: number; turn: number; note: string }[]>([])
+  const archiveDifficultyRef = useRef<string | null>(null)
+  const archivedEndRef = useRef(false)
   const savedReplayIdRef = useRef<string | null>(null) // reused across re-saves so one game = one DB entry
   // ONLINE replays are recorded server-side and handed to both seated players at game-over (rides in
   // synced state). We hold the received record + a stable save id (one online game = one DB entry).
@@ -415,6 +430,7 @@ export default function App() {
       if (!res2.ok) { applyAction(local, 1, { t: 'concede' }); applied = { t: 'concede' } }
     }
     recordingRef.current?.actions.push({ seat: 1, action: applied }) // for replay
+    archiveIfOver(local)
     // if this main action didn't move the bot's score, BAN it from the bot's search for the rest of
     // the turn (so it isn't re-picked in a loop). endTurn clears the ban set for the next turn.
     if (action.t === 'endTurn') botBannedRef.current.clear()
@@ -458,6 +474,7 @@ export default function App() {
     }
     if (!session?.noAchv) { try { applyAchievements(JSON.parse(snapshot), local, actor, action) } catch { /* cosmetic */ } }
     recordingRef.current?.actions.push({ seat: actor, action }) // for replay
+    archiveIfOver(local)
     pushLocalHistory0(snapshot)
     bumpSession()
     return true
@@ -536,6 +553,7 @@ export default function App() {
   function beginHotseatState(state: GameState, noAchv = false) {
     localHistory.current = []
     recordingRef.current = null // scenarios (which reuse this) don't record; startHotseat sets it after
+    reviewFlagsRef.current = []; archiveDifficultyRef.current = null; archivedEndRef.current = false
     savedReplayIdRef.current = null
     localClockTick.current = Date.now()
     const sess: Session = {
@@ -547,6 +565,7 @@ export default function App() {
       requestUndo: localUndo, // both players share the screen: undo is by consent
       onSaveReplay: saveReplay,
       onReportBug: reportBugLocal,
+      onFlagForReview: flagForReview,
       send: (action: Action) => {
         // in hotseat the acting player is whoever the UI says is acting
         armGoBack(action)
@@ -576,7 +595,7 @@ export default function App() {
     myDeckFromCollection.current = !!deckA.fromCollection || !!deckB.fromCollection
     const seed = Math.floor(Math.random() * 0xffffffff)
     const first: PlayerId = Math.random() < 0.5 ? 0 : 1
-    const decks: [DeckList, DeckList] = [withCollection(deckA), withCollection(deckB)]
+    const decks: [DeckList, DeckList] = [forLocalGame(deckA), forLocalGame(deckB)]
     const state = createGame(decks, ['Player 1', 'Player 2'], seed, first, clock, { secondSeer })
     beginHotseatState(state)
     recordingRef.current = startReplay('hotseat', decks, ['Player 1', 'Player 2'], seed, first, clock, secondSeer)
@@ -589,6 +608,14 @@ export default function App() {
     // scenarios are sandboxes (any board is constructible) → no achievements here
     const copy = JSON.parse(JSON.stringify(state)) as GameState
     migrateLegacyKeywords(copy) // scenarios saved before typed keywords hold them as text
+    // a scenario may carry someone else's custom token art (saved from their game): new tokens made here
+    // only use the arts this account is granted (tokens already on the board keep theirs, as an opponent's would)
+    const granted = grantedArtIds()
+    for (const p of copy.players) {
+      if (!p.tokenArt) continue
+      p.tokenArt = sanitizeCustomArt({ art: p.tokenArt }, granted).art
+      if (!p.tokenArt) delete p.tokenArt
+    }
     beginHotseatState(copy, true)
   }
 
@@ -618,6 +645,48 @@ export default function App() {
   function pushLocalHistory0(snapshot: string) {
     localHistory.current.push(snapshot)
     if (localHistory.current.length > 80) localHistory.current.shift()
+  }
+
+  /** Write the current local game to the match archive on this machine (the dev server saves it under
+   *  match-replays/ in the repo; see packages/server/src/localReplays.ts). Called automatically when a
+   *  recorded game ends and whenever a moment is flagged. Quietly does nothing where the archive is off
+   *  (the hosted site), so play is never interrupted. */
+  async function archiveLocalGame(): Promise<string> {
+    const r = recordingRef.current
+    const local = localRef.current
+    if (!r || !local) throw new Error('This game is not being recorded.')
+    const finished = local.phase === 'over'
+    const res = await fetch('/api/local-replay', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        replay: { ...r, winner: finished ? local.winner : undefined },
+        finished,
+        turn: local.turn,
+        botDifficulty: archiveDifficultyRef.current,
+        flags: reviewFlagsRef.current.filter((f) => f.at <= r.actions.length),
+      }),
+    })
+    const body = await res.json().catch(() => ({}))
+    if (!res.ok) throw new Error(body?.error ?? 'Could not save the game.')
+    return String(body.file ?? '')
+  }
+  function archiveIfOver(local: GameState) {
+    if (local.phase !== 'over' || archivedEndRef.current || !recordingRef.current) return
+    archivedEndRef.current = true
+    void archiveLocalGame().catch(() => { /* archive off or unreachable: nothing to do */ })
+  }
+  /** flag the current moment of a local game for review, with a note, and save the game now */
+  async function flagForReview(note: string): Promise<string> {
+    const r = recordingRef.current
+    const local = localRef.current
+    if (!r || !local) throw new Error('This game is not being recorded.')
+    const flag = { at: r.actions.length, turn: local.turn, note: note.trim() }
+    reviewFlagsRef.current.push(flag)
+    try { return await archiveLocalGame() } catch (e) {
+      reviewFlagsRef.current = reviewFlagsRef.current.filter((f) => f !== flag)
+      throw e
+    }
   }
 
   /** save a replay of the current local game to your account (public or private). */
@@ -659,7 +728,7 @@ export default function App() {
     disposeBotWorker() // fresh worker (and plan cache) for the new game
     const seed = Math.floor(Math.random() * 0xffffffff)
     const first: PlayerId = Math.random() < 0.5 ? 0 : 1
-    const decks: [DeckList, DeckList] = [withCollection(myDeck), withCollection(botDeck)]
+    const decks: [DeckList, DeckList] = [forLocalGame(myDeck), forLocalGame(botDeck)]
     const state = createGame(decks, ['You', 'Computer'], seed, first, clock, { secondSeer })
     localClockTick.current = Date.now()
     const sess: Session = {
@@ -672,6 +741,7 @@ export default function App() {
       requestUndo: localUndo, // the computer is a gracious opponent
       onSaveReplay: saveReplay,
       onReportBug: reportBugLocal,
+      onFlagForReview: flagForReview,
       send: (action: Action) => {
         armGoBack(action)
         runLocal(0, action)
@@ -681,6 +751,7 @@ export default function App() {
     setSession(sess)
     setPage('game')
     recordingRef.current = startReplay('bot', decks, ['You', 'Computer'], seed, first, clock, secondSeer)
+    reviewFlagsRef.current = []; archiveDifficultyRef.current = difficulty; archivedEndRef.current = false
   }
 
   // apply exactly ONE bot action (seat 1). Shared by the auto-timer and the
@@ -1180,6 +1251,7 @@ export default function App() {
           onWatchReplay={() => setPage('replays')}
           isAdmin={auth.isAdminUser()}
           onOpenBugs={() => setPage('bugs')}
+          onOpenTokenArt={() => setPage('tokenArt')}
           initialRoomCode={pendingJoin}
         />
       )}
@@ -1204,6 +1276,7 @@ export default function App() {
           onOpenScenario={(state) => startScenario(state)}
         />
       )}
+      {page === 'tokenArt' && <TokenArtAdminPage onBack={() => setPage('home')} />}
       {page === 'decks' && <DeckBuilder onBack={() => setPage('home')} />}
       {page === 'collection' && <CollectionPage onBack={() => setPage('home')} />}
       {page === 'scenarios' && (

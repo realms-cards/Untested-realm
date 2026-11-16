@@ -26,6 +26,8 @@ import {
   siteAt,
   orthAdjacentWrapped,
   directionReach,
+  rangedAcrossOffered,
+  rangedTrace,
   grantedAbilities,
   cemeteryActivations,
   isDisabled,
@@ -448,6 +450,7 @@ function GameInner({
   const [showSymbols, setShowSymbols] = useState(false) // GUI symbol legend (Q / ❔ button)
   // report-a-bug modal: a message + a snapshot (replay-so-far + scenario) captured by onReportBug
   const [bugOpen, setBugOpen] = useState(false)
+  const [flagState, setFlagState] = useState<'idle' | 'saved' | 'failed'>('idle') // the rail's Flag-for-review button
   const [scenOpen, setScenOpen] = useState(false) // 💾 save this board as a scenario (online games, replays)
   const [bugText, setBugText] = useState('')
   const [bugState, setBugState] = useState<'idle' | 'sending' | 'sent' | 'error'>('idle')
@@ -462,6 +465,8 @@ function GameInner({
   // Which multi-square body (amoeba / Rack-stretched avatar) is hovered — its connective
   // tissue + copies rise above other minions while hovered or selected (see body overlay).
   const [bodyHover, setBodyHover] = useState<string | null>(null)
+  // the unit chip under the pointer (null on leave) — lights up its own Sir Perceval quest flag
+  const [hoverUnitId, setHoverUnitId] = useState<string | null>(null)
   const [rip, setRip] = useState<string | null>(null)
   // draggable mulligan modal — offset from its default (centered) position; null = centered
   const [mullPos, setMullPos] = useState<{ x: number; y: number } | null>(null)
@@ -824,6 +829,8 @@ function GameInner({
     | { cells: { x: number; y: number; dmg: number }[]; redSites: { x: number; y: number }[]; element: string; name: string; casterId: string; caster: { x: number; y: number } | null; id: number }
     | null
   >(null)
+  // the cast panel that goes with it: the card, who played it, and the log lines it produced
+  const [castInfo, setCastInfo] = useState<{ card: string; caption: string; byMe: boolean | null; lines: string[]; id: number } | null>(null)
   const areaFxSeen = useRef<number>(-1)
   const areaSeq = (view as any).flow?.areaReveal?.seq
   useEffect(() => {
@@ -846,6 +853,14 @@ function GameInner({
     // OR ANY magic cast / activated ability (the golden caster + writing always animate, even if
     // nothing was affected — an ability always lights its own caster site, see sealAbilityReveal)
     if (cells.length < 2 && redSites.length < 1 && !((rev.spell || rev.ability) && caster)) { setAreaFx(null); return }
+    // cast panel: the card + what it did. Only for a real card (the avatar's "plays a site" reveal has
+    // a sentence for a name, not a card).
+    const cardName = revealCardName(rev)
+    if (cardName) {
+      const owner = cu ? (cu as any).controller : null
+      setCastInfo({ card: cardName, caption: rev.name && rev.name !== cardName ? rev.name : '', byMe: owner === 0 || owner === 1 ? owner === me : null, lines: (rev.lines ?? []) as string[], id: rev.seq })
+      setBigPops((prev) => prev.filter((bp) => bp.name !== cardName)) // the panel shows the same card
+    } else setCastInfo(null) // never leave an older card beside a newer reveal
     setAreaFx({ cells, redSites, element: rev.element ?? 'none', name: rev.name ?? '', casterId: rev.casterId ?? '', caster, id: rev.seq })
     const t = setTimeout(() => setAreaFx((cur) => (cur && cur.id === rev.seq ? null : cur)), 5000)
     return () => clearTimeout(t)
@@ -882,6 +897,79 @@ function GameInner({
     if (walkMs <= 0) show()
     else window.setTimeout(show, walkMs)
   }, [battleSeq])
+
+  // Minion damage numbers: every hit on a minion that isn't a melee strike or site-wide area damage
+  // appends to flow.unitDamage (seq-stamped, synced to both seats). Float the number over that minion's
+  // card for ~1.6s (over its death ghost if the hit killed it); hits landing in one update add up.
+  const [dmgFx, setDmgFx] = useState<Record<string, { amount: number; id: number }>>({})
+  // units with a hit not yet settled into a number (their action paused on a prompt), and the death
+  // ghosts held past their fade waiting for that number
+  const dmgPendingRef = useRef<Set<string>>(new Set())
+  dmgPendingRef.current = new Set((((view as any).flow?.dmgPending ?? []) as { unitId: string }[]).map((h) => h.unitId))
+  const heldGhosts = useRef<Set<string>>(new Set())
+  const dmgFxSeen = useRef<number>((view as any).flow?.unitDamageSeq ?? 0)
+  const dmgFxTimers = useRef<number[]>([])
+  useEffect(() => () => { for (const t of dmgFxTimers.current) window.clearTimeout(t) }, [])
+  const dmgSeq = (view as any).flow?.unitDamageSeq ?? 0
+  useEffect(() => {
+    if (dmgSeq < dmgFxSeen.current) dmgFxSeen.current = dmgSeq // UNDO re-arm (see moveFx)
+    const hits = ((view as any).flow?.unitDamage ?? []) as { unitId: string; amount: number; seq: number }[]
+    const fresh = hits.filter((h) => h.seq > dmgFxSeen.current)
+    if (!fresh.length) return
+    dmgFxSeen.current = Math.max(dmgFxSeen.current, ...hits.map((h) => h.seq))
+    const add: Record<string, { amount: number; id: number }> = {}
+    for (const h of fresh) add[h.unitId] = { amount: (add[h.unitId]?.amount ?? 0) + h.amount, id: h.seq }
+    setDmgFx((cur) => ({ ...cur, ...add }))
+    // a held death ghost gets its number now: replay its fade (a fresh key) with the number on it
+    const replay = [...heldGhosts.current].filter((id) => add[id])
+    if (replay.length) {
+      for (const id of replay) heldGhosts.current.delete(id)
+      const keys = new Map(replay.map((id) => [id, `${id}#${add[id].id}`]))
+      setDeathGhosts((g) => g.map((d) => (keys.has(d.id) && d._gid === d.id ? { ...d, _gid: keys.get(d.id)! } : d)))
+      const t = window.setTimeout(() => setDeathGhosts((g) => g.filter((d) => ![...keys.values()].includes(String(d._gid)))), 2800)
+      dmgFxTimers.current.push(t)
+    }
+    const timer = window.setTimeout(() => {
+      dmgFxTimers.current = dmgFxTimers.current.filter((t) => t !== timer)
+      setDmgFx((cur) => {
+        const next = { ...cur }
+        for (const [k, v] of Object.entries(add)) if (next[k]?.id === v.id) delete next[k]
+        return next
+      })
+    }, 1600)
+    dmgFxTimers.current.push(timer)
+  }, [dmgSeq])
+  // Life gained: an Avatar's gain appends to flow.lifeGains (seq-stamped, synced to both seats). Float a green
+  // "+N" up from that Avatar's card for ~1.6s; gains landing in one update add up.
+  const [lifeFx, setLifeFx] = useState<Record<string, { amount: number; id: number }>>({})
+  const lifeFxSeen = useRef<number>((view as any).flow?.lifeGainSeq ?? 0)
+  const lifeSeq = (view as any).flow?.lifeGainSeq ?? 0
+  useEffect(() => {
+    if (lifeSeq < lifeFxSeen.current) lifeFxSeen.current = lifeSeq // UNDO re-arm (see moveFx)
+    const gains = ((view as any).flow?.lifeGains ?? []) as { unitId: string; amount: number; seq: number }[]
+    const fresh = gains.filter((h) => h.seq > lifeFxSeen.current)
+    if (!fresh.length) return
+    lifeFxSeen.current = Math.max(lifeFxSeen.current, ...gains.map((h) => h.seq))
+    const add: Record<string, { amount: number; id: number }> = {}
+    for (const h of fresh) add[h.unitId] = { amount: (add[h.unitId]?.amount ?? 0) + h.amount, id: h.seq }
+    setLifeFx((cur) => ({ ...cur, ...add }))
+    const timer = window.setTimeout(() => {
+      dmgFxTimers.current = dmgFxTimers.current.filter((t) => t !== timer)
+      setLifeFx((cur) => {
+        const next = { ...cur }
+        for (const [k, v] of Object.entries(add)) if (next[k]?.id === v.id) delete next[k]
+        return next
+      })
+    }, 1600)
+    dmgFxTimers.current.push(timer)
+  }, [lifeSeq])
+  // a held ghost whose hit settled WITHOUT a number (it was area damage, shown on its site) is let go
+  useEffect(() => {
+    const gone = [...heldGhosts.current].filter((id) => !dmgPendingRef.current.has(id))
+    if (!gone.length) return
+    for (const id of gone) heldGhosts.current.delete(id)
+    setDeathGhosts((g) => g.filter((d) => !(gone.includes(d.id) && d._gid === d.id)))
+  }, [view])
 
   // Mana-gain floats: every time a source PROVIDES mana the engine appends to flow.manaGains
   // (seq-stamped, synced to both seats). Float a "+n ◆" over each source square for ~1s. A
@@ -1044,7 +1132,13 @@ function GameInner({
     if (deadStill.length) {
       setDeathGhosts((g) => [...g, ...deadStill])
       const ids = new Set(deadStill.map((s) => s._gid))
-      window.setTimeout(() => setDeathGhosts((g) => g.filter((d) => !ids.has(d._gid))), 2800)
+      // a ghost whose damage number is still pending (its action paused on a prompt) is HELD until the
+      // number is published (see the dmgFx effect), so the killing blow still shows
+      window.setTimeout(() => setDeathGhosts((g) => g.filter((d) => {
+        if (!ids.has(d._gid)) return true
+        if (dmgPendingRef.current.has(d.id)) { heldGhosts.current.add(d.id); return true }
+        return false
+      })), 2800)
     }
     for (const { ghost, delay } of deadWalkers) {
       window.setTimeout(() => {
@@ -1348,7 +1442,12 @@ function GameInner({
         // a Ranged unit reaches only `ranged` squares; a projectile spell flies until it's stopped
         const range = isCard ? Infinity : (() => { try { return effKeywords(st, src).ranged ?? 1 } catch { return 1 } })()
         const lanes = directionReach(st, src.x, src.y) // site-following, stops at void + projectile blockers
-        for (const dir of ['n', 's', 'e', 'w'] as const) add(dir, lanes[dir].slice(0, range + 1)) // cap at range (index 0 = source)
+        for (const dir of ['n', 's', 'e', 'w'] as const) {
+          add(dir, lanes[dir].slice(0, range + 1)) // cap at range (index 0 = source)
+          // Sissi Marksmen: when the engine would offer the shot across the top/bottom edge, draw that flight too
+          if (!isCard && (() => { try { return rangedAcrossOffered(st, src, src.controller, dir) } catch { return false } })())
+            add(dir, [src, ...rangedTrace(st, src, src.controller, dir, src.x, src.y, true).path])
+        }
         return { cells, color: elementColor(getCard(name ?? '')?.elements), from: { x: src.x, y: src.y } as { x: number; y: number } | null }
       }
     }
@@ -2125,9 +2224,9 @@ function GameInner({
         return
       }
       if (!nearAnchor(x, y)) return
-      // respect an engine-authoritative legal set (explosion step-range): a too-far square is inert
-      const opts = currentTargetOptions()
-      if (opts && !opts.some((o) => 'square' in o && o.square.x === x && o.square.y === y)) return
+      // only the engine's legal set (legalTargetsFor) is clickable: a too-far square (explosion step-range)
+      // or a location outside the caster's region (the void, for a surface caster) is inert
+      if (legalNow && !legalNow.some((o) => 'square' in o && o.square.x === x && o.square.y === y)) return
       pickTarget(`sq:${x},${y}`)
       return
     }
@@ -2561,6 +2660,13 @@ function GameInner({
       if (mode.casters.includes(u.id)) beginCast(mode.cardId, u.id)
       return
     }
+    // a square prompt whose highlighted square is covered by this chip (Undertow diving a Submerge
+    // minion in place): the click picks the chip's square, like clicking the square itself
+    if (prompt && promptIsMine && prompt.kind === 'chooseSquare' && !prompt.data?.area2x2 && !prompt.data?.edgeSelect) {
+      const only: { x: number; y: number }[] | undefined = prompt.data?.squares
+      if (!only || only.some((s) => s.x === u.x && s.y === u.y)) send({ t: 'prompt', promptId: prompt.id, choice: { x: u.x, y: u.y } })
+      return
+    }
     // prompt target picking (damage allocation uses its own modal)
     if (prompt && promptIsMine && prompt.kind === 'chooseTargets') {
       // a unit sitting on a site would otherwise swallow the click — for a SITE prompt,
@@ -2607,8 +2713,8 @@ function GameInner({
       // to be occupied. Sent WITHOUT a region to match the highlighted legal set (the
       // engine validates square targets region-agnostically), exactly like a bare-square click.
       if (spec?.what === 'square') {
-        const opts = currentTargetOptions() // explosion step-range: a too-far square under a unit is inert
-        if (opts && !opts.some((o) => 'square' in o && o.square.x === u.x && o.square.y === u.y)) return
+        // only a legal square is clickable (explosion step-range, the caster's region…) — even under a unit
+        if (legalNow && !legalNow.some((o) => 'square' in o && o.square.x === u.x && o.square.y === u.y)) return
         pickTarget(`sq:${u.x},${u.y}`)
         return
       }
@@ -3365,6 +3471,20 @@ function GameInner({
               <span className="ri">🐛</span><span className="rl">Report bug</span>
             </button>
           )}
+          {!isSpectator && session.onFlagForReview && (
+            <button
+              className={`railbtn ${flagState === 'saved' ? 'selected' : ''}`}
+              title="Flag this moment for review — add a note about what went wrong (a bot misplay, a rules error). The game is saved to match-replays/review on this machine."
+              onClick={async () => {
+                const note = window.prompt('Flag this moment for review.\nWhat went wrong? (for example: "bot stole my minion and never attacked with it")')
+                if (note === null) return
+                try { await session.onFlagForReview!(note); setFlagState('saved') } catch { setFlagState('failed') }
+                window.setTimeout(() => setFlagState('idle'), 2500)
+              }}
+            >
+              <span className="ri">🚩</span><span className="rl">{flagState === 'saved' ? 'Flagged ✓' : flagState === 'failed' ? 'Not saved' : 'Flag'}</span>
+            </button>
+          )}
           {session.sendChat && (
             <button ref={chatBtnRef} className={`railbtn ${chatOpen ? 'selected' : ''}`} title="Chat — send a quick phrase to your opponent" onClick={() => setChatOpen((v) => !v)}>
               <span className="ri">💬</span><span className="rl">Chat</span>
@@ -3444,9 +3564,7 @@ function GameInner({
       {mobile && logsOpen && (
         <div className="m-logs">
           <div className="m-logs-head"><b>Log</b><button onClick={() => setLogsOpen(false)}>✕</button></div>
-          <div className="log">
-            {view.log.slice(-60).map((e, i) => (<div key={i} className="logline"><LogLine msg={e.msg} onPick={setHover} /></div>))}
-          </div>
+          <GameLog log={view.log} tail={60} onPick={setHover} />
         </div>
       )}
 
@@ -3555,6 +3673,7 @@ function GameInner({
               ['🎭', 'Masked', 'An Imposter wearing another avatar’s face.'],
               ['🚫', 'Disabled', 'Loses all abilities AND can’t act (move / attack / tap). Badge on the unit, which is also greyed.'],
               ['🤐', 'Silenced', 'Its abilities are removed — but unlike Disabled it can still act. Badge shown on units, sites and artifacts.'],
+              ['🧊', 'Encased in ice', 'Its card is tinted blue and cracked: the Frost Mage encased it, so it is disabled and takes no damage until the next turn of the Frost Mage.'],
               ['↺', 'Tapped', 'Rotated 90° — already acted or used its tap ability this turn.'],
               ['⚔ ❤', 'Power / Life', 'A minion shows power(-damage)/defence; an avatar shows ❤life ⚔power. Power is also its life.'],
               ['🔺', 'Thresholds', 'Elemental thresholds from your sites (Air/Earth/Fire/Water) — needed to cast.'],
@@ -3905,8 +4024,8 @@ function GameInner({
                         </span>
                       ))}
                       {site && (
-                        <div className={`sitecard ${hasFaq(site.name) ? 'has-faq' : ''} ${stView && siteMatchesView(site.name, stKey) ? 'st-match' : ''}`} data-site={site.id} data-sitename={site.name} data-target={targetIds?.has(site.id) ? '1' : undefined} data-picked={(mode.m === 'magic' && mode.picked.includes(site.id)) || (mode.m === 'promptTargets' && mode.picked.includes(site.id)) ? '1' : undefined} onClick={(e) => clickSite(site, e)} onMouseEnter={() => showHover((site as any).trap?.realName ?? site.name, false, view.cards[site.cardId]?.art)}>
-                          <CardImg name={site.name} art={view.cards[site.cardId]?.art} className={`siteimg owner${site.controller}${site.controller != null && site.controller !== me ? ' site-theirs' : ''}`} />
+                        <div className={`sitecard ${hasFaq(site.name) ? 'has-faq' : ''} ${stView && siteMatchesView(site.name, stKey) ? 'st-match' : ''}`} data-site={site.id} data-sitename={site.name} data-target={targetIds?.has(site.id) ? '1' : undefined} data-picked={(mode.m === 'magic' && mode.picked.includes(site.id)) || (mode.m === 'promptTargets' && mode.picked.includes(site.id)) ? '1' : undefined} onClick={(e) => clickSite(site, e)} onMouseEnter={() => showHover((site as any).trap?.realName ?? site.name, false, artOf(view.cards, site))}>
+                          <CardImg name={site.name} art={artOf(view.cards, site)} className={`siteimg owner${site.controller}${site.controller != null && site.controller !== me ? ' site-theirs' : ''}`} />
                           {/* ownership strip — a real element ON TOP of the art (an inset box-shadow
                               on the <img> is painted over by the image, so it was invisible) */}
                           {!site.isRubble && (site.controller === 0 || site.controller === 1) && (
@@ -3916,6 +4035,14 @@ function GameInner({
                           {site.ward && <span className="kw siteward" title="Warded">🛡</span>}
                           {siteSilenced(st, site) && <span className={`kw sitesilenced${Object.values(view.auras).some((r) => r.squares.some((s) => s.x === x && s.y === y)) ? ' aura-shift' : ''}`} title="Silenced — its abilities are removed">🤐</span>}
                           {siteFlooded(st, site) && <span className="kw siteflood" title="Flooded">🌊</span>}
+                          {/* one 🚩 per Sir Perceval questing for this site; each glows only while ITS Perceval is hovered or selected */}
+                          {Object.entries((view.flow?.percevalQuest ?? {}) as Record<string, string>)
+                            .filter(([uid, sid]) => sid === site.id && view.units[uid])
+                            .map(([uid], i) => (
+                              <span key={uid} data-quest-unit={uid} style={i ? { marginLeft: `${i * 16}px` } : undefined}
+                                className={`kw sitequest${hoverUnitId === uid || (mode.m === 'unit' && mode.unitId === uid) ? ' quest-active' : ''}`}
+                                title="Sir Perceval's quest — when he enters this site, his controller draws a card and a new quest begins">🚩</span>
+                            ))}
                           {(site as any).trap && <span className="kw sitetrap" title={(site as any).trap.realName ? `Your hidden trap: ${(site as any).trap.realName}. Click the site on your turn to spring it.` : 'A hidden trap lurks here'}>🪤</span>}
                           {scorchedSquares.has(`${x},${y}`) && <span className="kw sitescorched" title="Scorched — a roaming Wildfire has burned here">🔥</span>}
                           {flameVisitedSquares.has(`${x},${y}`) && <span className="kw siteflamevisited" title="Kindled — the Flame of the First Ones has already burned at this site">🔥</span>}
@@ -3928,33 +4055,33 @@ function GameInner({
                         style={(uGridCols || uTileCols) ? ({ ['--cols' as any]: uGridCols || uTileCols } as React.CSSProperties) : undefined}
                       >
                         {mainUnits.map(({ u, ghost }) => (
-                          (u as any)._anim ? <AnimGhost key={`${(u as any)._gid}-anim`} u={u as unknown as AnimUnit} /> :
-                          <UnitChip key={ghost ? `${u.id}-g` : u.id} u={u} ghost={ghost} anim={movingUnitIds.has(u.id) ? 'move' : undefined} bodyActive={!u.size && (u.extraSquares?.length ?? 0) > 0 && ((mode.m === 'unit' && mode.unitId === u.id) || bodyHover === u.id)} st={st} me={me} matchKey={stView ? stKey : undefined} casterGlow={areaFx && areaFx.casterId === u.id ? areaFx.id : undefined} glow={unitGlow(u.id)} selected={(mode.m === 'unit' && mode.unitId === u.id) || ((mode.m === 'promptTargets' || mode.m === 'castSacrifice') && mode.picked.includes(u.id))}
+                          (u as any)._anim ? <AnimGhost key={`${(u as any)._gid}-anim`} u={u as unknown as AnimUnit} dmgFx={dmgFx[u.id]} /> :
+                          <UnitChip key={ghost ? `${u.id}-g` : u.id} u={u} ghost={ghost} anim={movingUnitIds.has(u.id) ? 'move' : undefined} bodyActive={!u.size && (u.extraSquares?.length ?? 0) > 0 && ((mode.m === 'unit' && mode.unitId === u.id) || bodyHover === u.id)} st={st} me={me} matchKey={stView ? stKey : undefined} casterGlow={areaFx && areaFx.casterId === u.id ? areaFx.id : undefined} dmgFx={ghost ? undefined : dmgFx[u.id]} lifeFx={ghost ? undefined : lifeFx[u.id]} glow={unitGlow(u.id)} selected={(mode.m === 'unit' && mode.unitId === u.id) || ((mode.m === 'promptTargets' || mode.m === 'castSacrifice') && mode.picked.includes(u.id))}
                             picked={(mode.m === 'promptTargets' || mode.m === 'magic') && mode.picked.includes(u.id)}
                             target={!!targetIds?.has(u.id)}
                             onClick={(ev) => clickUnit(u, ev)}
-                            onHover={(n, f, art) => { showHover(n, f, art); setBodyHover(!u.size && (u.extraSquares?.length ?? 0) > 0 ? u.id : null) }} onArtClick={clickCarriedArtifact} artTargets={targetIds ?? undefined} />
+                            onHover={(n, f, art) => { showHover(n, f, art); setBodyHover(!u.size && (u.extraSquares?.length ?? 0) > 0 ? u.id : null) }} onUnitHover={setHoverUnitId} onArtClick={clickCarriedArtifact} artTargets={targetIds ?? undefined} />
                         ))}
                       </div>
                       {stripUnits.length > 0 && (
                         <div className="subsurface">
                           {stripUnits.map(({ u, ghost }) => (
-                            (u as any)._anim ? <AnimGhost key={`${(u as any)._gid}-anim`} u={u as unknown as AnimUnit} /> :
-                            <UnitChip key={ghost ? `${u.id}-g` : u.id} u={u} ghost={ghost} bodyActive={!u.size && (u.extraSquares?.length ?? 0) > 0 && ((mode.m === 'unit' && mode.unitId === u.id) || bodyHover === u.id)} st={st} me={me} matchKey={stView ? stKey : undefined} casterGlow={areaFx && areaFx.casterId === u.id ? areaFx.id : undefined} glow={unitGlow(u.id)} small selected={(mode.m === 'unit' && mode.unitId === u.id) || ((mode.m === 'promptTargets' || mode.m === 'castSacrifice') && mode.picked.includes(u.id))}
+                            (u as any)._anim ? <AnimGhost key={`${(u as any)._gid}-anim`} u={u as unknown as AnimUnit} dmgFx={dmgFx[u.id]} /> :
+                            <UnitChip key={ghost ? `${u.id}-g` : u.id} u={u} ghost={ghost} bodyActive={!u.size && (u.extraSquares?.length ?? 0) > 0 && ((mode.m === 'unit' && mode.unitId === u.id) || bodyHover === u.id)} st={st} me={me} matchKey={stView ? stKey : undefined} casterGlow={areaFx && areaFx.casterId === u.id ? areaFx.id : undefined} dmgFx={ghost ? undefined : dmgFx[u.id]} lifeFx={ghost ? undefined : lifeFx[u.id]} glow={unitGlow(u.id)} small selected={(mode.m === 'unit' && mode.unitId === u.id) || ((mode.m === 'promptTargets' || mode.m === 'castSacrifice') && mode.picked.includes(u.id))}
                               picked={(mode.m === 'promptTargets' || mode.m === 'magic') && mode.picked.includes(u.id)}
                               target={!!targetIds?.has(u.id)}
-                              onClick={(ev) => clickUnit(u, ev)} onHover={(n, f, art) => { showHover(n, f, art); setBodyHover(!u.size && (u.extraSquares?.length ?? 0) > 0 ? u.id : null) }} onArtClick={clickCarriedArtifact} artTargets={targetIds ?? undefined} />
+                              onClick={(ev) => clickUnit(u, ev)} onHover={(n, f, art) => { showHover(n, f, art); setBodyHover(!u.size && (u.extraSquares?.length ?? 0) > 0 ? u.id : null) }} onUnitHover={setHoverUnitId} onArtClick={clickCarriedArtifact} artTargets={targetIds ?? undefined} />
                           ))}
                         </div>
                       )}
                       {voidStrip.length > 0 && (
                         <div className="voidunits">
                           {voidStrip.map(({ u, ghost }) => (
-                            (u as any)._anim ? <AnimGhost key={`${(u as any)._gid}-anim`} u={u as unknown as AnimUnit} /> :
-                            <UnitChip key={ghost ? `${u.id}-g` : u.id} u={u} ghost={ghost} bodyActive={!u.size && (u.extraSquares?.length ?? 0) > 0 && ((mode.m === 'unit' && mode.unitId === u.id) || bodyHover === u.id)} st={st} me={me} matchKey={stView ? stKey : undefined} casterGlow={areaFx && areaFx.casterId === u.id ? areaFx.id : undefined} glow={unitGlow(u.id)} small selected={(mode.m === 'unit' && mode.unitId === u.id) || ((mode.m === 'promptTargets' || mode.m === 'castSacrifice') && mode.picked.includes(u.id))}
+                            (u as any)._anim ? <AnimGhost key={`${(u as any)._gid}-anim`} u={u as unknown as AnimUnit} dmgFx={dmgFx[u.id]} /> :
+                            <UnitChip key={ghost ? `${u.id}-g` : u.id} u={u} ghost={ghost} bodyActive={!u.size && (u.extraSquares?.length ?? 0) > 0 && ((mode.m === 'unit' && mode.unitId === u.id) || bodyHover === u.id)} st={st} me={me} matchKey={stView ? stKey : undefined} casterGlow={areaFx && areaFx.casterId === u.id ? areaFx.id : undefined} dmgFx={ghost ? undefined : dmgFx[u.id]} lifeFx={ghost ? undefined : lifeFx[u.id]} glow={unitGlow(u.id)} small selected={(mode.m === 'unit' && mode.unitId === u.id) || ((mode.m === 'promptTargets' || mode.m === 'castSacrifice') && mode.picked.includes(u.id))}
                               picked={(mode.m === 'promptTargets' || mode.m === 'magic') && mode.picked.includes(u.id)}
                               target={!!targetIds?.has(u.id)}
-                              onClick={(ev) => clickUnit(u, ev)} onHover={(n, f, art) => { showHover(n, f, art); setBodyHover(!u.size && (u.extraSquares?.length ?? 0) > 0 ? u.id : null) }} onArtClick={clickCarriedArtifact} artTargets={targetIds ?? undefined} />
+                              onClick={(ev) => clickUnit(u, ev)} onHover={(n, f, art) => { showHover(n, f, art); setBodyHover(!u.size && (u.extraSquares?.length ?? 0) > 0 ? u.id : null) }} onUnitHover={setHoverUnitId} onArtClick={clickCarriedArtifact} artTargets={targetIds ?? undefined} />
                           ))}
                         </div>
                       )}
@@ -3966,11 +4093,11 @@ function GameInner({
                               className={`ground-art ${stView && artMatchesView(st, me, a, stKey) ? 'st-match' : ''}${a.name === 'Doomsday Device' && a.counters?.fuse === 1 ? ' doom-hot' : ''}${getCard(a.name).subtypes.includes('Monument') ? (a.conjuredBy === me ? ' mono-mine' : ' mono-theirs') : ''}`}
                               data-artifact={a.id}
                               data-target={targetIds?.has(a.id) ? '1' : undefined}
-                              onMouseEnter={() => showHover(a.name, false, view.cards[a.cardId]?.art)}
+                              onMouseEnter={() => showHover(a.name, false, artOf(view.cards, a))}
                               onClick={(ev) => clickGroundArtifact(a, ev)}
                               title={`${a.name} — click to pick up with a unit here`}
                             >
-                              <CardImg name={a.name} art={view.cards[a.cardId]?.art} className={`groundimg${a.conjuredBy !== me ? ' art-theirs' : ''}`} />
+                              <CardImg name={a.name} art={artOf(view.cards, a)} className={`groundimg${a.conjuredBy !== me ? ' art-theirs' : ''}`} />
                               {a.name === 'The Immortal Throne' && (
                                 <span className="throne-level" title={`The Immortal Throne — level ${a.counters?.level ?? 0}`}>
                                   {a.counters?.level ?? 0}
@@ -4002,10 +4129,10 @@ function GameInner({
                                 className={`ground-art site-aura${a.controller === me ? ' aura-mine' : a.controller != null ? ' aura-theirs' : ''}${(sel || magicPick) ? ' aura-selectable' : ''}${!sel && !magicPick && editing ? ' aura-editing' : ''}`}
                                 data-aura={a.id}
                                 data-aura-hit={!sel && !magicPick && auraEdit ? a.id : undefined}
-                                onMouseEnter={() => showHover(a.name, false, view.cards[a.cardId]?.art)} title={a.name}
+                                onMouseEnter={() => showHover(a.name, false, artOf(view.cards, a))} title={a.name}
                                 style={clickable ? { cursor: 'pointer' } : undefined}
                                 onClick={sel ? (e) => { e.stopPropagation(); selectAura(a.id) } : magicPick ? (e) => { e.stopPropagation(); pickTarget(a.id) } : auraEdit ? (e) => { e.stopPropagation(); selectAuraEdit(a.id) } : undefined}>
-                                <CardImg name={a.name} art={view.cards[a.cardId]?.art} className="groundimg" />
+                                <CardImg name={a.name} art={artOf(view.cards, a)} className="groundimg" />
                               </div>
                             )
                           })}
@@ -4025,7 +4152,7 @@ function GameInner({
               const rect = overlayRect([{ x: u.x, y: u.y }, { x: u.x + 1, y: u.y }, { x: u.x, y: u.y + 1 }, { x: u.x + 1, y: u.y + 1 }], flip)
               return (
                 <div key={u.id} className="overlay-item" style={rect}>
-                  <UnitChip u={u} st={st} me={me} matchKey={stView ? stKey : undefined} casterGlow={areaFx && areaFx.casterId === u.id ? areaFx.id : undefined} glow={unitGlow(u.id)} big selected={(mode.m === 'unit' && mode.unitId === u.id) || ((mode.m === 'promptTargets' || mode.m === 'castSacrifice') && mode.picked.includes(u.id))}
+                  <UnitChip u={u} st={st} me={me} matchKey={stView ? stKey : undefined} casterGlow={areaFx && areaFx.casterId === u.id ? areaFx.id : undefined} dmgFx={dmgFx[u.id]} lifeFx={lifeFx[u.id]} glow={unitGlow(u.id)} big selected={(mode.m === 'unit' && mode.unitId === u.id) || ((mode.m === 'promptTargets' || mode.m === 'castSacrifice') && mode.picked.includes(u.id))}
                     picked={(mode.m === 'promptTargets' || mode.m === 'magic') && mode.picked.includes(u.id)}
                     target={!!targetIds?.has(u.id)}
                     onClick={(ev) => clickUnit(u, ev)} onHover={showHover} onArtClick={clickCarriedArtifact} artTargets={targetIds ?? undefined} />
@@ -4127,7 +4254,7 @@ function GameInner({
                       boxShadow: '0 0 8px 2px rgba(255,255,255,0.5)',
                       zIndex: (sel || magicPick) ? 9 : 4,
                     }}
-                    onMouseEnter={() => showHover(a.name, false, view.cards[a.cardId]?.art)}
+                    onMouseEnter={() => showHover(a.name, false, artOf(view.cards, a))}
                     title={a.name}
                   >
                     {/* only the card thumbnail is the hit target (not the whole edge bar) — for the Editor,
@@ -4184,7 +4311,7 @@ function GameInner({
                     <span
                       data-aura-hit={sel || magicPick || auraEdit ? a.id : undefined}
                       className={`auraimg-wrap${a.controller === me ? ' aura-mine' : a.controller != null ? ' aura-theirs' : ''}${sel || magicPick || auraEdit ? ' aura-edit-hit' : ''}`}
-                      style={{ ...fan, ...(sel || magicPick || auraEdit ? { cursor: 'pointer' as const } : {}) }} onMouseEnter={() => showHover(a.name, false, view.cards[a.cardId]?.art)} title={a.name}
+                      style={{ ...fan, ...(sel || magicPick || auraEdit ? { cursor: 'pointer' as const } : {}) }} onMouseEnter={() => showHover(a.name, false, artOf(view.cards, a))} title={a.name}
                       onClick={sel ? (e) => { e.stopPropagation(); selectAura(a.id) } : magicPick ? (e) => { e.stopPropagation(); pickTarget(a.id) } : auraEdit ? (e) => { e.stopPropagation(); selectAuraEdit(a.id) } : undefined}
                     >
                       <CardImg name={a.name} className="auraimg" />
@@ -4430,6 +4557,7 @@ function GameInner({
             return (
               <>
                 {/* the caster UNIT glows gold via its UnitChip (castfx-unitglow), not a square tile */}
+                <CastArrows key={`cf-arrows${areaFx.id}`} from={areaFx.caster} to={[...areaFx.redSites, ...areaFx.cells]} rgb={rgb} flip={flip} />
                 {areaFx.redSites.map((s) => (
                   <div key={`cf-red${areaFx.id}:${s.x},${s.y}`} className="castfx-red castfx-fade" style={overlayRect([s], flip)} aria-hidden="true" />
                 ))}
@@ -4612,15 +4740,15 @@ function GameInner({
         <div className="preview">
           {faqView
             ? <FaqPanel name={hover} />
-            : (hover ?? oppPlay) && <CardHover name={(hover ?? oppPlay)!} flipped={hover ? hoverFlip : false} art={hover ? hoverArt : undefined} />}
+            : hover
+              ? <CardHover name={hover} flipped={hoverFlip} art={hoverArt} />
+              // nothing hovered: the last spell cast / ability used (by either player) with what it did,
+              // else the last card the opponent played
+              : castInfo
+                ? <CastPanel info={castInfo} onClose={() => setCastInfo(null)} />
+                : oppPlay && <CardHover name={oppPlay} />}
         </div>
-        <div className="log">
-          {view.log.slice(-40).map((e, i) => (
-            <div key={i} className="logline">
-              <LogLine msg={e.msg} onPick={setHover} />
-            </div>
-          ))}
-        </div>
+        <GameLog log={view.log} tail={40} onPick={setHover} />
       </aside>
 
       {/* mulligan */}
@@ -4731,7 +4859,7 @@ function GameInner({
                 return (
                   <div key={id} data-artchoice={id}
                     className={`handcard ${cur.picked.includes(id) ? 'selected' : ''}`}
-                    onMouseEnter={() => showHover(a.name, false, view.cards[a.cardId]?.art)}
+                    onMouseEnter={() => showHover(a.name, false, artOf(view.cards, a))}
                     onClick={() => toggle(id)}>
                     <CardImg name={a.name} className="handimg" />
                   </div>
@@ -4743,7 +4871,7 @@ function GameInner({
                 return (
                   <div key={id} data-artchoice={id}
                     className={`handcard ${cur.picked.includes(id) ? 'selected' : ''}`}
-                    onMouseEnter={() => showHover(o.name, false, view.cards[o.cardId]?.art)}
+                    onMouseEnter={() => showHover(o.name, false, artOf(view.cards, o))}
                     onClick={() => toggle(id)}>
                     <CardImg name={o.name} className="handimg" />
                   </div>
@@ -5279,6 +5407,14 @@ function PlayerInfoPopup({ view, pid, me, onZone, onClose }: {
 /** pixel rect spanning the displayed squares (board coords → CSS, flip-aware) */
 // Site squares use the NATIVE site-art aspect ratio (531:380 ≈ 1.3974) so the art
 // fills the square with no cropping (object-fit: cover == contain at this ratio).
+/** a permanent's chosen artwork (alternative art / printing) — only while it still IS its own card. One
+ *  that became something else (Vengeful Heir as the avenged Knight, a transformed minion, a copied site)
+ *  draws its CURRENT name's art; and a hidden trap (site name ≠ card name) never leaks its real art. */
+function artOf(cards: Record<string, { name: string; art?: string }> | undefined, p: { cardId: string; name: string }): string | undefined {
+  const c = cards?.[p.cardId]
+  return c && c.name === p.name ? c.art : undefined
+}
+
 const SQ_W = 211
 const SQ_H = 151
 const GAP = 4
@@ -5492,6 +5628,44 @@ function auraWallBg(name: string): string {
 }
 /** a log line with every card name turned into a coloured, clickable reference
  *  (click / hover → show it in the lateral detail panel). */
+/** The game log with a search box. Empty box: the latest `tail` lines, as before. With a query: every
+ *  line of the log the client holds that contains it (case-insensitive, matched against the text as
+ *  displayed), each prefixed with its turn so an old line can be placed. Esc or ✕ clears. */
+function GameLog({ log, tail, onPick }: { log: { turn: number; msg: string }[]; tail: number; onPick: (name: string) => void }) {
+  const [query, setQuery] = useState('')
+  const needle = query.trim().toLowerCase()
+  const lines = useMemo(
+    () => (needle ? log.filter((e) => relabelCoords(e.msg).toLowerCase().includes(needle)) : log.slice(-tail)),
+    [log, needle, tail],
+  )
+  return (
+    <div className="logwrap">
+      <div className="logsearch">
+        <input
+          type="text"
+          value={query}
+          placeholder="Search log…"
+          aria-label="Search the game log"
+          spellCheck={false}
+          onChange={(e) => setQuery(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Escape') { setQuery(''); e.currentTarget.blur() } }}
+        />
+        {needle && <span className="logcount">{lines.length} of {log.length}</span>}
+        {query && <button type="button" title="Clear search" aria-label="Clear search" onClick={() => setQuery('')}>✕</button>}
+      </div>
+      <div className="log">
+        {needle && lines.length === 0 && <div className="logempty">No log lines match.</div>}
+        {lines.map((e, i) => (
+          <div key={i} className="logline">
+            {needle && <span className="logturn">T{e.turn}</span>}
+            <LogLine msg={e.msg} onPick={onPick} />
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 function LogLine({ msg, onPick }: { msg: string; onPick: (name: string) => void }) {
   msg = relabelCoords(msg) // show square names (a1…) in the player's chosen coordinate system
   const re = cardNameRegex()
@@ -5576,6 +5750,91 @@ function EvilIcon({ className }: { className?: string }) {
  * continue button dismisses it immediately. The parent keys this by the play
  * counter, so each fresh play remounts it with a fresh timer.
  */
+/** a card by name, or null when the name is not a card (a caption, a token the client lacks…) */
+function cardDefOrNull(name: string): ReturnType<typeof getCard> | null {
+  try { return getCard(name) } catch { return null }
+}
+
+/** the card behind a cast reveal: the engine's `card`, else recovered from its caption
+ *  ("<card>'s ability", "<card> shoots!", "<avatar> plays <site>") */
+function revealCardName(rev: any): string {
+  const candidates = [rev?.card, ...[/^(.+)'s ability$/, /^(.+) shoots!$/, / plays (.+)$/].map((re) => String(rev?.name ?? '').match(re)?.[1])]
+  return candidates.find((c): c is string => typeof c === 'string' && !!c && !!cardDefOrNull(c)) ?? ''
+}
+
+/**
+ * Arrows from the caster's square to every square its spell or ability touched, drawn in the board's
+ * overlay coordinates (same layout maths as overlayRect). Each arrow stops short of the target's centre
+ * so it points AT the card rather than covering it, draws itself in, then fades with the rest of the
+ * cast reveal. Wide area spells would be a fan of arrows over a grid that already numbers each square,
+ * so past a handful of targets the arrows are skipped.
+ */
+function CastArrows({ from, to, rgb, flip }: { from: { x: number; y: number } | null; to: { x: number; y: number }[]; rgb: string; flip: boolean }) {
+  if (!from) return null
+  const centre = (s: { x: number; y: number }) => {
+    const col = flip ? GRID_W - 1 - s.x : s.x
+    const row = flip ? s.y : GRID_H - 1 - s.y
+    return { cx: col * (SQ_W + GAP) + SQ_W / 2, cy: row * (SQ_H + GAP) + SQ_H / 2 }
+  }
+  const seen = new Set<string>([`${from.x},${from.y}`])
+  const targets = to.filter((t) => { const k = `${t.x},${t.y}`; if (seen.has(k)) return false; seen.add(k); return true })
+  if (!targets.length || targets.length > 8) return null
+  const a = centre(from)
+  const W = GRID_W * (SQ_W + GAP) - GAP
+  const H = GRID_H * (SQ_H + GAP) - GAP
+  const id = `castarrow-${rgb.replace(/,/g, '-')}`
+  return (
+    <svg className="castfx-arrows castfx-fade" width={W} height={H} viewBox={`0 0 ${W} ${H}`} aria-hidden="true">
+      <defs>
+        <marker id={id} viewBox="0 0 10 10" refX="7" refY="5" markerWidth="4.2" markerHeight="4.2" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill={`rgb(${rgb})`} stroke="#0b0d16" strokeWidth="1.2" strokeLinejoin="round" />
+        </marker>
+      </defs>
+      {targets.map((t) => {
+        const b = centre(t)
+        const dx = b.cx - a.cx, dy = b.cy - a.cy
+        const len = Math.hypot(dx, dy) || 1
+        const ux = dx / len, uy = dy / len
+        const x1 = a.cx + ux * 46, y1 = a.cy + uy * 46 // leave the caster's art visible
+        const x2 = b.cx - ux * 52, y2 = b.cy - uy * 52 // stop short of the target's centre
+        return (
+          <g key={`${t.x},${t.y}`}>
+            <line x1={x1} y1={y1} x2={x2} y2={y2} className="castfx-arrow-edge" />
+            <line x1={x1} y1={y1} x2={x2} y2={y2} className="castfx-arrow" stroke={`rgb(${rgb})`} markerEnd={`url(#${id})`} pathLength={1} />
+          </g>
+        )
+      })}
+    </svg>
+  )
+}
+
+/**
+ * The cast panel: after a spell is cast or an ability used — by either player — the card preview shows
+ * that card (art and rules text) with who played it and the log lines it produced. It stays until the
+ * next cast, a hover (which shows the hovered card instead, then returns), or ✕.
+ */
+function CastPanel({ info, onClose }: { info: { card: string; caption: string; byMe: boolean | null; lines: string[] }; onClose: () => void }) {
+  const who = info.byMe === null ? '' : info.byMe ? 'You' : 'Opponent'
+  const type = cardDefOrNull(info.card)?.type
+  const verb = type === 'Magic' ? 'cast' : type === 'Site' && / plays /.test(info.caption) ? 'played' : 'used'
+  const caption = verb === 'played' ? '' : info.caption
+  return (
+    <div className="castpanel">
+      <div className="castpanel-head">
+        <span>{who ? `${who} ${verb}` : verb[0].toUpperCase() + verb.slice(1)}{caption ? ` — ${caption}` : ''}</span>
+        <button type="button" title="Dismiss" aria-label="Dismiss" onClick={onClose}>✕</button>
+      </div>
+      <CardHover name={info.card} />
+      {info.lines.length > 0 && (
+        <div className="castpanel-lines">
+          <div className="castpanel-sub">What happened</div>
+          {info.lines.map((l, i) => (<div key={i} className="castpanel-line">{relabelCoords(l)}</div>))}
+        </div>
+      )}
+    </div>
+  )
+}
+
 function OppPlayPopup({ name, onClose }: { name: string; onClose: () => void }) {
   const [paused, setPaused] = useState(false)
   const closeRef = useRef(onClose)
@@ -5683,21 +5942,35 @@ type AnimUnit = UnitState & { _anim: 'death' | 'teleout' | 'move'; _slot: number
 
 // The card-sized chip for an AnimUnit: a plain `.unit` (so it inherits the grid/tile sizing of its square)
 // showing just the art + tapped rotation, non-interactive, running the death/teleport/walk animation.
-function AnimGhost({ u }: { u: AnimUnit }) {
+function AnimGhost({ u, dmgFx }: { u: AnimUnit; dmgFx?: { amount: number; id: number } }) {
   return (
     <div className={`unit anim-ghost anim-${u._anim} ${u.tapped ? 'tapped' : ''}`} aria-hidden="true">
       <CardImg name={u.name} flipped={u.flipped} className="unitimg" />
+      {dmgFx && u._anim === 'death' && <DmgFloat key={dmgFx.id} amount={dmgFx.amount} />}
     </div>
   )
 }
 
-function UnitChip({ u, st, me, small, big, ghost, bodyActive, selected, picked, target, glow, anim, matchKey, casterGlow, onClick, onHover, onArtClick, artTargets }: {
+// A minion's damage number, drawn inside its card and sized off that card (container-query units), so it
+// fits the real tile whatever its size — a crowded square's small chips or an oversized minion.
+function LifeFloat({ amount }: { amount: number }) {
+  return <span className="lifegain-fx" data-lifegain={amount} aria-hidden="true"><span className="lifegain-num">+{amount}</span></span>
+}
+
+function DmgFloat({ amount }: { amount: number }) {
+  return <span className="unitdmg-fx" data-unitdmg={amount} aria-hidden="true"><span className="unitdmg-num">{amount}</span></span>
+}
+
+function UnitChip({ u, st, me, small, big, ghost, bodyActive, selected, picked, target, glow, anim, matchKey, casterGlow, dmgFx, lifeFx, onClick, onHover, onUnitHover, onArtClick, artTargets }: {
   u: UnitState; st: any; me: PlayerId; small?: boolean; big?: boolean; ghost?: boolean; bodyActive?: boolean; selected?: boolean; picked?: boolean; target?: boolean
   glow?: 'target' | 'defender' | 'defender-hot' | 'attacker' | 'atk' // combat prompt: attack target (gold, big) / defenders (gold, small; -hot on hover) / attacker (red) / 'atk' = a same-square strike target while I have a unit selected (gold + "⚔ Attack" tooltip)
   anim?: 'move' // this real unit is mid-walk (see moveFx) — glow + float it above its square-mates
   matchKey?: string // subtype view active: highlight this unit if it matches the selected subtype
   casterGlow?: number // spell-cast reveal: this unit just cast — glow gold; the number (reveal id) restarts the animation
+  dmgFx?: { amount: number; id: number } // damage just dealt to this minion (a ranged shot, a spell…) — float the number
+  lifeFx?: { amount: number; id: number } // life this Avatar just gained — float a green +N
   onClick: (ev: React.MouseEvent) => void; onHover: (name: string, flipped?: boolean, art?: string) => void
+  onUnitHover?: (unitId: string | null) => void // precise pointer enter/leave (Sir Perceval's quest flag)
   onArtClick?: (artId: string, ev: React.MouseEvent) => void; artTargets?: Set<string>
 }) {
   let atk = 0
@@ -5730,13 +6003,16 @@ function UnitChip({ u, st, me, small, big, ghost, bodyActive, selected, picked, 
       data-target={target ? '1' : undefined}
       data-picked={picked ? '1' : undefined}
       data-glow={glow ?? undefined}
-      className={`unit ${u.controller === me ? 'mine' : 'theirs'} ${u.tapped ? 'tapped' : ''} ${selected ? 'selected' : ''} ${target ? 'hl-target' : ''} ${glow ? `glow-${glow}` : ''} ${anim ? `anim-${anim}` : ''} ${u.isAvatar ? 'avatar' : ''} ${small ? 'small' : ''} ${big ? 'big' : ''} ${ghost ? 'bodyghost' : ''} ${bodyActive ? 'body-active' : ''} ${hasFaq(u.name) ? 'has-faq' : ''} ${(() => { try { return matchKey && unitMatchesView(st, u, matchKey) ? 'st-match' : '' } catch { return '' } })()}`}
+      className={`unit ${u.controller === me ? 'mine' : 'theirs'} ${u.tapped ? 'tapped' : ''} ${selected ? 'selected' : ''} ${target ? 'hl-target' : ''} ${glow ? `glow-${glow}` : ''} ${anim ? `anim-${anim}` : ''} ${u.isAvatar ? 'avatar' : ''} ${lifeFx ? 'lifegaining' : ''} ${small ? 'small' : ''} ${big ? 'big' : ''} ${ghost ? 'bodyghost' : ''} ${bodyActive ? 'body-active' : ''} ${hasFaq(u.name) ? 'has-faq' : ''} ${(() => { try { return matchKey && unitMatchesView(st, u, matchKey) ? 'st-match' : '' } catch { return '' } })()}`}
       onClick={onClick}
-      onMouseEnter={() => onHover(maskName ?? u.name, maskName ? false : u.flipped, maskName ? undefined : st.cards?.[u.cardId]?.art)}
+      onMouseEnter={() => { onHover(maskName ?? u.name, maskName ? false : u.flipped, maskName ? undefined : artOf(st.cards, u)); onUnitHover?.(u.id) }}
+      onMouseLeave={onUnitHover ? () => onUnitHover(null) : undefined}
       title={glow === 'atk' ? `⚔ Attack ${u.name}` : u.name}
     >
-      <CardImg name={maskName ?? u.name} flipped={maskName ? false : u.flipped} art={maskName ? undefined : st.cards?.[u.cardId]?.art} className="unitimg" />
+      <CardImg name={maskName ?? u.name} flipped={maskName ? false : u.flipped} art={maskName ? undefined : artOf(st.cards, u)} className="unitimg" />
       {casterGlow !== undefined && <span key={casterGlow} className="castfx-unitglow castfx-fade" aria-hidden="true" />}
+      {dmgFx && <DmgFloat key={dmgFx.id} amount={dmgFx.amount} />}
+      {lifeFx && <LifeFloat key={lifeFx.id} amount={lifeFx.amount} />}
       {auras.map((v, i) => <Aura key={v} variant={v} ring={i} />)}
       <span className="unitstats" title={u.isAvatar ? 'Life / Power' : 'Power / Defence'}>
         <span className="statval">
@@ -5809,6 +6085,10 @@ function UnitChip({ u, st, me, small, big, ghost, bodyActive, selected, picked, 
             )
           })}
         </span>
+      )}
+      {/* encased in ice by the Frost Mage: disabled and takes no damage until its caster's next turn */}
+      {((st.flow?.encased ?? []) as { unitId: string }[]).some((e) => e.unitId === u.id) && (
+        <span className="encased-ice" title="Encased in ice (Frost Mage) — disabled and takes no damage until the Frost Mage's next turn"><svg className="encased-ice-cracks" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true"><path d="M38 44 L20 30 L6 33 M20 30 L14 12 M38 44 L44 18 L40 4 M44 18 L58 10 M38 44 L66 34 L84 22 L96 24 M66 34 L72 12 M38 44 L62 58 L80 56 L94 66 M62 58 L70 80 L66 96 M38 44 L34 70 L44 86 L40 98 M34 70 L18 80 L4 76 M38 44 L14 56 L2 52" /></svg></span>
       )}
       {disabled && <img className="marker" src="/tokens/disabled.webp" alt="disabled" title="Disabled" />}
       {(() => {
